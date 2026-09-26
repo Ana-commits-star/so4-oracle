@@ -12,6 +12,13 @@ pub struct HttpRouteLabels {
     pub status_class: String,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+pub struct TokenSourceLabels {
+    pub symbol: String,
+    pub token: String,
+    pub source: String,
+}
+
 /// All price-cycle and keeper-cycle counters, held behind a single mutex.
 ///
 /// These fields used to be independent `AtomicU64`s, each updated with its
@@ -40,21 +47,15 @@ struct Counters {
     http_request_duration_buckets: BTreeMap<String, [u64; 7]>,
     http_request_duration_sum: BTreeMap<String, f64>,
     http_auth_failures_total: BTreeMap<String, u64>,
+    keeper_balance_low_count: u64,
+    prices_stale_count: u64,
 }
 
 #[derive(Debug, Default)]
 pub struct Metrics {
-    pub price_cycle_count: AtomicU64,
-    pub price_cycle_latency_ms: AtomicU64,
-    pub keeper_cycle_count: AtomicU64,
-    pub keeper_cycle_latency_ms: AtomicU64,
-    pub orders_executed: AtomicU64,
-    pub deposits_executed: AtomicU64,
-    pub withdrawals_executed: AtomicU64,
-    pub submit_failures: AtomicU64,
-    pub keeper_balance_low_count: AtomicU64,
-    pub prices_stale_count: AtomicU64,
-    pub last_metrics_update: AtomicU64,
+    counters: Mutex<Counters>,
+    token_source_fetch_failures: Mutex<BTreeMap<TokenSourceLabels, u64>>,
+    token_source_outlier_rejections: Mutex<BTreeMap<TokenSourceLabels, u64>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -98,24 +99,20 @@ impl Metrics {
         keeper_balance_low: bool,
         prices_stale: bool,
     ) {
-        self.keeper_cycle_count.fetch_add(1, Ordering::Relaxed);
-        self.keeper_cycle_latency_ms
-            .store(latency_ms, Ordering::Relaxed);
-        self.orders_executed
-            .fetch_add(orders as u64, Ordering::Relaxed);
-        self.deposits_executed
-            .fetch_add(deposits as u64, Ordering::Relaxed);
-        self.withdrawals_executed
-            .fetch_add(withdrawals as u64, Ordering::Relaxed);
-        self.submit_failures
-            .fetch_add(errors as u64, Ordering::Relaxed);
+        let mut c = self.counters.lock().unwrap_or_else(|p| p.into_inner());
+        c.keeper_cycle_count += 1;
+        c.keeper_cycle_latency_ms = latency_ms;
+        c.orders_executed += orders as u64;
+        c.deposits_executed += deposits as u64;
+        c.withdrawals_executed += withdrawals as u64;
+        c.submit_failures += errors as u64;
         if keeper_balance_low {
-            self.keeper_balance_low_count.fetch_add(1, Ordering::Relaxed);
+            c.keeper_balance_low_count += 1;
         }
         if prices_stale {
-            self.prices_stale_count.fetch_add(1, Ordering::Relaxed);
+            c.prices_stale_count += 1;
         }
-        self.update_timestamp();
+        Self::stamp(&mut c);
     }
 
     pub fn record_submit_failure(&self) {
@@ -231,17 +228,19 @@ impl Metrics {
     pub fn to_response(&self) -> MetricsResponse {
         let c = self.counters.lock().unwrap_or_else(|p| p.into_inner());
         MetricsResponse {
-            price_cycle_count: self.price_cycle_count.load(Ordering::Relaxed),
-            price_cycle_latency_ms: self.price_cycle_latency_ms.load(Ordering::Relaxed),
-            keeper_cycle_count: self.keeper_cycle_count.load(Ordering::Relaxed),
-            keeper_cycle_latency_ms: self.keeper_cycle_latency_ms.load(Ordering::Relaxed),
-            orders_executed: self.orders_executed.load(Ordering::Relaxed),
-            deposits_executed: self.deposits_executed.load(Ordering::Relaxed),
-            withdrawals_executed: self.withdrawals_executed.load(Ordering::Relaxed),
-            submit_failures: self.submit_failures.load(Ordering::Relaxed),
-            keeper_balance_low_count: self.keeper_balance_low_count.load(Ordering::Relaxed),
-            prices_stale_count: self.prices_stale_count.load(Ordering::Relaxed),
-            last_metrics_update: self.last_metrics_update.load(Ordering::Relaxed),
+            price_cycle_count: c.price_cycle_count,
+            price_cycle_latency_ms: c.price_cycle_latency_ms,
+            token_fetch_ok: c.token_fetch_ok,
+            token_fetch_failures: c.token_fetch_failures,
+            keeper_cycle_count: c.keeper_cycle_count,
+            keeper_cycle_latency_ms: c.keeper_cycle_latency_ms,
+            orders_executed: c.orders_executed,
+            deposits_executed: c.deposits_executed,
+            withdrawals_executed: c.withdrawals_executed,
+            submit_failures: c.submit_failures,
+            keeper_balance_low_count: c.keeper_balance_low_count,
+            prices_stale_count: c.prices_stale_count,
+            last_metrics_update: c.last_metrics_update,
         }
     }
 
@@ -371,14 +370,14 @@ impl Metrics {
         output.push_str("# TYPE oracle_keeper_balance_low_count counter\n");
         output.push_str(&format!(
             "oracle_keeper_balance_low_count {}\n",
-            self.keeper_balance_low_count.load(Ordering::Relaxed)
+            c.keeper_balance_low_count
         ));
 
         output.push_str("# HELP oracle_prices_stale_count Total number of cycles with stale prices\n");
         output.push_str("# TYPE oracle_prices_stale_count counter\n");
         output.push_str(&format!(
             "oracle_prices_stale_count {}\n",
-            self.prices_stale_count.load(Ordering::Relaxed)
+            c.prices_stale_count
         ));
 
         output.push_str("# HELP oracle_last_metrics_update Timestamp of last metrics update\n");
@@ -416,7 +415,7 @@ mod tests {
     #[test]
     fn test_metrics_recording() {
         let metrics = Metrics::new();
-        metrics.record_price_cycle(100);
+        metrics.record_price_cycle(100, 0, 0);
         metrics.record_keeper_cycle(200, 5, 3, 2, 1, true, false);
 
         let response = metrics.to_response();

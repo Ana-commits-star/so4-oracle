@@ -9,7 +9,8 @@ use tracing::{error, info, warn};
 use crate::chain::scval;
 use crate::chain::tx_builder;
 use crate::keeper;
-use crate::state::{AppState, CachedPrice, FailedSubmission, KeeperExecution};
+use crate::state::{AppState, CachedPrice, CycleStatus, FailedSubmission, KeeperExecution, KeeperStatus, IN_FLIGHT_EXPIRY, MAX_CONSECUTIVE_EXECUTION_FAILURES};
+use crate::submit::SubmitError;
 
 impl std::error::Error for SequenceFetchError {}
 
@@ -114,6 +115,28 @@ pub struct CycleSummary {
     pub keeper_balance_low: bool,
 }
 
+const ACCOUNT_SEQUENCE_RETRY_ATTEMPTS: u32 = 3;
+const ACCOUNT_SEQUENCE_RETRY_BASE_DELAY_MS: u64 = 1000;
+const SIMULATE_RETRY_ATTEMPTS: u32 = 3;
+const SIMULATE_RETRY_BASE_DELAY_MS: u64 = 1000;
+const KEEPER_CYCLE_TIMEOUT_SECS: u64 = 50;
+
+#[derive(Debug)]
+pub enum SequenceFetchError {
+    Network(String),
+    MissingOrInvalid(String),
+}
+
+impl std::fmt::Display for SequenceFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SequenceFetchError::Network(msg) => write!(f, "Network error: {}", msg),
+            SequenceFetchError::MissingOrInvalid(msg) => write!(f, "Missing or invalid: {}", msg),
+        }
+    }
+}
+
+
 async fn execute_keeper_cycle(state: Arc<AppState>) -> Result<CycleSummary, String> {
     let keeper_cfg = keeper::KeeperBalanceConfig {
         horizon_url: state.config.horizon_url.clone(),
@@ -121,7 +144,7 @@ async fn execute_keeper_cycle(state: Arc<AppState>) -> Result<CycleSummary, Stri
         min_balance_xlm: state.config.min_keeper_balance_xlm,
     };
 
-    let keeper_balance_low = match keeper::check_keeper_balance(&keeper_cfg).await {
+    let keeper_balance_low = match keeper::check_keeper_balance(&keeper_cfg, &state.keeper_balance_below_min).await {
         Ok(stroops) => {
             let xlm = stroops as f64 / keeper::XLM_IN_STROOPS as f64;
             if xlm < state.config.min_keeper_balance_xlm {
@@ -207,6 +230,8 @@ async fn execute_keeper_cycle(state: Arc<AppState>) -> Result<CycleSummary, Stri
         keeper_balance_low: false,
     };
 
+    let mut sequence_cache = None;
+
     if !prices_stale {
         let tx_hash = set_prices_on_chain(&state, &prices).await?;
         info!(hash = %tx_hash, "set_prices_confirmed");
@@ -218,6 +243,7 @@ async fn execute_keeper_cycle(state: Arc<AppState>) -> Result<CycleSummary, Stri
                 &state.config.order_handler_contract_id,
                 "execute_order",
                 order_key,
+                &mut sequence_cache,
             )
             .await
             {
@@ -234,6 +260,13 @@ async fn execute_keeper_cycle(state: Arc<AppState>) -> Result<CycleSummary, Stri
                     .await;
                 }
                 Err(error) => {
+                    let consecutive_exec_failures = {
+                        let mut exec_counts = state.execution_failure_counts.lock().await;
+                        let count = exec_counts.entry(order_key.clone()).or_insert(0);
+                        *count += 1;
+                        *count
+                    };
+
                     summary.errors += 1;
                     warn!(key = %order_key, %error, "order_execution_failed");
 
@@ -244,6 +277,7 @@ async fn execute_keeper_cycle(state: Arc<AppState>) -> Result<CycleSummary, Stri
                             &state.config.order_handler_contract_id,
                             "freeze_order",
                             order_key,
+                            &mut sequence_cache,
                         )
                         .await
                         {
@@ -641,23 +675,23 @@ fn is_bad_sequence_error(error: &str) -> bool {
 /// falls through to other detection paths).
 fn is_bad_sequence_xdr(error_result_xdr: &str) -> bool {
     use base64::Engine;
-    use stellar_xdr::{Decode, TransactionResult, TransactionResultResult};
+    use stellar_xdr::{ReadXdr, TransactionResult, TransactionResultResult};
 
     let bytes = match base64::engine::general_purpose::STANDARD.decode(error_result_xdr) {
         Ok(b) => b,
         Err(_) => return false,
     };
 
-    let tx_result = match TransactionResult::from_xdr_base64(error_result_xdr) {
+    let tx_result = match TransactionResult::from_xdr(error_result_xdr, stellar_xdr::Limits::none()) {
         Ok(r) => r,
         // Manual fallback: try decoding from raw bytes
-        Err(_) => match TransactionResult::decode(&mut &bytes[..]) {
+        Err(_) => match TransactionResult::from_xdr(&mut &bytes[..], stellar_xdr::Limits::none()) {
             Ok(r) => r,
             Err(_) => return false,
         },
     };
 
-    matches!(tx_result.result, TransactionResultResult::TxBadSeq(_))
+    matches!(tx_result.result, TransactionResultResult::TxBadSeq)
 }
 
 /// Execute a handler contract call, using and maintaining a per-cycle cached
@@ -731,7 +765,7 @@ async fn execute_handler(
                 || matches!(
                     &error,
                     SubmitError::Rejected {
-                        error_result_xdr: Some(xdr),
+                        error_result_xdr: Some(ref xdr),
                         ..
                     } if is_bad_sequence_xdr(xdr)
                 );
@@ -782,7 +816,7 @@ async fn get_account_sequence_once(state: &Arc<AppState>) -> Result<u64, Sequenc
     if let Some(error) = response_json.get("error") {
         return Err(SequenceFetchError::Network(format!(
             "getAccount error: {}",
-            truncate_rpc_error(error)
+            truncate_rpc_error(&error.to_string())
         )));
     }
 
@@ -834,9 +868,9 @@ async fn simulate_contract_call_once(
     // ScVal::Address, everything else becomes ScVal::Symbol (#997).
     let scval_args: Vec<stellar_xdr::ScVal> = args
         .iter()
-        .map(|arg| {
+        .map(|arg| -> Result<stellar_xdr::ScVal, String> {
             if arg.starts_with('C') || arg.starts_with('G') {
-                stellar_xdr::ScVal::Address(crate::chain::scval::strkey_to_sc_address(arg)?)
+                Ok(stellar_xdr::ScVal::Address(crate::chain::scval::strkey_to_sc_address(arg)?))
             } else {
                 let sym: stellar_xdr::ScSymbol = arg
                     .to_string()
@@ -890,7 +924,7 @@ async fn simulate_contract_call_once(
         serde_json::from_str(&body).map_err(|e| format!("Failed to parse RPC response: {e}"))?;
 
     if let Some(error) = response_json.get("error") {
-        return Err(format!("Simulation error: {}", truncate_rpc_error(error)));
+        return Err(format!("Simulation error: {}", truncate_rpc_error(&error.to_string())));
     }
 
     let result = response_json
@@ -989,6 +1023,14 @@ async fn record_execution(
     });
     if keeper_status.last_executions.len() > 100 {
         keeper_status.last_executions.pop_front();
+    }
+}
+
+fn truncate_rpc_error(error: &str) -> String {
+    if error.len() > 100 {
+        format!("{}...", &error[..100])
+    } else {
+        error.to_string()
     }
 }
 
@@ -1132,7 +1174,7 @@ mod tests {
                         submit_threshold_bps: 10,
                         min: 0.0,
                         max: 0.0,
-                        sources_used: vec![],
+                        pyth_max_confidence_bps: 50,
                     },
                     shared_config::TokenConfig {
                         symbol: "STALE".to_string(),
@@ -1149,7 +1191,7 @@ mod tests {
                         submit_threshold_bps: 10,
                         min: 0.0,
                         max: 0.0,
-                        sources_used: vec![],
+                        pyth_max_confidence_bps: 50,
                     },
                 ],
             },

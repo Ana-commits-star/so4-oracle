@@ -35,6 +35,4 @@ panic = "abort"
 # stellar-xdr v27 pins stellar-strkey 0.0.13 transitively; the direct
 # dependency in oracle/Cargo.toml is 0.0.18. Pre-1.0 semver cannot unify
 # these, so three copies were being compiled. This patch collapses them.
-[patch.crates-io]
-stellar-strkey = { version = "0.0.18" }
 

@@ -478,10 +478,10 @@ mod tests {
 
     #[test]
     fn submit_error_display_poll_timeout() {
-        let err = SubmitError::PollTimeout;
+        let err = SubmitError::PollTimeout { hash: "abc".into() };
         assert_eq!(
             err.to_string(),
-            format!("transaction not confirmed after {MAX_POLL_ATTEMPTS} attempts")
+            format!("transaction abc not confirmed after {MAX_POLL_ATTEMPTS} attempts")
         );
     }
 

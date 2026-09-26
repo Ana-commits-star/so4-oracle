@@ -161,9 +161,9 @@ pub(crate) async fn fetch_spot_price_with_url(
         };
 
     let response = if use_query {
+        let url_str = format!("{}?currency={}", clean_url, base_currency);
         crate::http::client()
-            .get(clean_url)
-            .query(&[("currency", base_currency)])
+            .get(&url_str)
             .send()
             .await
     } else {

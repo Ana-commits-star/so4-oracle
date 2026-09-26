@@ -1,4 +1,4 @@
-pub mod price;
+
 pub mod binance;
 pub mod chain;
 pub mod coinbase;

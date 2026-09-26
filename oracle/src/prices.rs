@@ -80,15 +80,7 @@ pub fn aggregate_prices(
         .ok_or_else(|| "cannot compute confidence interval".to_string())?;
     let median = compute_median_allow_single(&cluster.filtered_prices).unwrap_or(props.min);
 
-    let rejected_sources = filter_result
-        .rejected
-        .into_iter()
-        .map(|(source, price, deviation)| RejectedSource {
-            source,
-            price,
-            deviation_bps: deviation,
-        })
-        .collect();
+
 
     Ok(AggregatedPrice {
         min: props.min,

@@ -79,7 +79,7 @@ impl FromRequestParts<Arc<AppState>> for AdminAuth {
             .and_then(|value| value.strip_prefix("Bearer "));
 
         match actual {
-            Some(actual) if crate::auth::constant_time_eq(actual.as_bytes(), expected.as_str().as_bytes()) => {
+            Some(actual) if constant_time_eq(actual.as_bytes(), expected.as_str().as_bytes()) => {
                 Ok(AdminAuth)
             }
             _ => {
@@ -274,6 +274,19 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .layer(axum::middleware::from_fn(map_method_not_allowed))
 }
 
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+
+    for index in 0..max_len {
+        let a = left.get(index).copied().unwrap_or(0);
+        let b = right.get(index).copied().unwrap_or(0);
+        diff |= (a ^ b) as usize;
+    }
+
+    diff == 0
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{AppState, Config};
@@ -322,7 +335,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let response = app.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.status(), axum::http::StatusCode::METHOD_NOT_ALLOWED);
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
